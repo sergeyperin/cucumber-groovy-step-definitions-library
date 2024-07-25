@@ -1,0 +1,66 @@
+#!/usr/bin/env groovy
+import static java.util.UUID.randomUUID
+
+// -*- mode: groovy -*-
+// These are purposely put in global scope.
+artifactoryServer = Artifactory.server('')
+buildInfo = Artifactory.newBuildInfo()
+buildInfo.env.capture = true
+mvnBuild = Artifactory.newMavenBuild()
+mvnBuild.tool = 'M3'
+mvnBuild.resolver(server: artifactoryServer, releaseRepo: '', snapshotRepo: '')
+mvnBuild.deployer(server: artifactoryServer, releaseRepo: '', snapshotRepo: '')
+
+jwtIamUsername = "jwt.iam.username=jenkins-build-agent-user"
+
+
+def mvn(mvn_args) {
+  configFileProvider([configFile(fileId: '', variable: 'MAVEN_SETTINGS')]) {
+    // In Jenkins, connections to artifactory run through our NAT gateways. NAT gateways
+    // have a tcp connection timeout of 5 minutes. Some of our build steps, e.g. dependency-check,
+    // take longer than 5 minutes. When this happens, the connections in the httpclient pool will
+    // be reset, and attempting to use them will result in a connection reset error. Maven only
+    // retries 3 times to download an artifact, i.e. 4 total attemps (original attempt plus three
+    // retries). The httpclient connection pool therefore needs to be smaller than that, so maven
+    // will go through all the reset connections and then be able to create new ones.
+    //
+    // You might wonder why we don't configure the connections or the pool to behave correctly.
+    // Unfortunately, the maven wagon plugin does not expose much of the httpclient configuration,
+    // so we are left with this hack.
+    // (thomasvandoren, 2018-03-06)
+    if ("${env.BRANCH_NAME}" != "master") {
+      // Disable maven jar deployment for non-master builds.
+      mvnBuild.deployer.deployArtifacts = false
+    }
+    def mvnBuildInfo = mvnBuild.run(pom: 'pom.xml', goals: "--batch-mode --settings $MAVEN_SETTINGS -Dmaven.wagon.httpconnectionManager.maxPerRoute=2 ${mvn_args}".toString(), buildInfo: buildInfo)
+    artifactoryServer.publishBuildInfo(mvnBuildInfo)
+  }
+}
+
+
+
+node('') {
+  try {
+
+    stage('Dev - Checkout') {
+      checkout scm
+    }
+
+    stage('Dev - Build and Test') {
+      withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: '', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+        mvn('clean install -Dmaven.test.failure.ignore=true')
+      }
+    }
+
+    if (currentBuild.previousBuild && currentBuild.previousBuild.result == "FAILURE") {
+      slackSend channel: '#jenkins', color: 'good', message: "${env.JOB_NAME} - # ${env.BUILD_NUMBER} Fixed \n ${env.BUILD_URL}"
+    }
+  } catch (err) {
+    echo "error during utils build: ${err}"
+    currentBuild.result = "FAILURE"
+    if ("${env.BRANCH_NAME}" == "master") {
+      slackSend channel: '#jenkins', color: 'danger', message: "${env.JOB_NAME} - # ${env.BUILD_NUMBER} Failed \n ${env.BUILD_URL}"
+    }
+    throw err
+  }
+}
